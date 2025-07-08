@@ -46,6 +46,6 @@ Before running the script, you must update the following variable inside the Pyt
 -----------------------------------------
 
 
-this discription is also ai generated
+this description is also ai generated
 Its mainly used on linux but could also work on other platforms
 please help me clean this mess up, im not good at coding
