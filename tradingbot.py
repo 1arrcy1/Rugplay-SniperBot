@@ -6,6 +6,8 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver.common.keys import Keys
 from selenium.common.exceptions import (
     WebDriverException, NoSuchWindowException, TimeoutException,
     NoSuchElementException
@@ -19,6 +21,10 @@ import signal
 import sys
 import random
 import os
+import shutil
+import tempfile
+import itertools
+
 
 # --- Configuration & Constants ---
 CHROMEDRIVER_PATH = "/usr/bin/chromedriver"
@@ -28,7 +34,7 @@ DEBUG_MODE = False
 HEADLESS_MODE = not DEBUG_MODE
 
 # URLs
-BASE_URL = "https://rugplay.com"
+BASE_URL = "https://s3rver.nl"
 PORTFOLIO_API_URL = f"{BASE_URL}/api/portfolio/total"
 MARKET_API_URL = f"{BASE_URL}/api/market?sortBy=createdAt&sortOrder=desc&limit=50"
 NEWEST_COIN_API_URL = f"{BASE_URL}/api/market?sortBy=createdAt&sortOrder=desc&limit=1"
@@ -482,43 +488,42 @@ class TradeApp(tk.Tk):
         self.buy_button.config(state=tk.DISABLED)
         self.sell_button.config(state=tk.DISABLED)
 
-        threading.Thread(target=self._trade_token_flow, args=(token_symbol, trade_type, amount)).start()
+        # --- FIX: Pass the main driver and a name for manual trades ---
+        threading.Thread(target=self._trade_token_flow, args=(token_symbol, trade_type, amount, self.selenium_driver, "Manual")).start()
 
-    def _trade_token_flow(self, token_symbol, trade_type, amount):
-        """Simulates a trade. Returns True on success, False on failure."""
-        self.after(0, lambda: self.update_status(f"Starting {trade_type} for {amount} of {token_symbol}..."))
-        if not self.api or not self.api.is_browser_open():
-             self.after(0, lambda: self.update_status("Trade failed: Browser not open.", is_error=True))
-             return False
+        # Re-enable buttons after a short delay to prevent spamming
+        self.after(3000, lambda: self.buy_button.config(state=tk.NORMAL))
+        self.after(3000, lambda: self.sell_button.config(state=tk.NORMAL))
 
-        trade_successful = False
-        driver = self.selenium_driver
+    def _trade_token_flow(self, token_symbol, trade_type, amount, driver, worker_name="Manual"):
+
+        log_prefix = f"[{worker_name}:{token_symbol}]"
+        self.after(0, lambda: self.update_status(f"{log_prefix} Starting {trade_type} for {amount}..."))
+
         try:
-            # 1. Navigate to coin page to ensure a clean state
+            # 1. Navigate to the correct coin page within the specified driver
             coin_page_url = f"{BASE_URL}/coin/{token_symbol}"
-            self.after(0, lambda: self.update_status(f"Navigating to {token_symbol} page..."))
-            driver.get(coin_page_url)
-            WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+            # Only navigate if not already there to save time
+            if driver.current_url != coin_page_url:
+                self.after(0, lambda: self.update_status(f"{log_prefix} Navigating to coin page..."))
+                driver.get(coin_page_url)
+
+            # Wait for a key element to ensure the page is interactive
+            WebDriverWait(driver, 15).until(
+                EC.element_to_be_clickable((By.XPATH, TRADE_BUTTON_XPATH_TEMPLATE.format(trade_type='buy')))
+            )
 
             # 2. Click BUY/SELL tab
             trade_button_xpath = TRADE_BUTTON_XPATH_TEMPLATE.format(trade_type=trade_type.lower())
             trade_button = WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.XPATH, trade_button_xpath)))
             trade_button.click()
-            self.after(0, lambda: self.update_status(f"Clicked '{trade_type.upper()}' tab."))
+            self.after(0, lambda: self.update_status(f"{log_prefix} Clicked '{trade_type.upper()}' tab."))
 
             # 3. Enter amount
             amount_input = WebDriverWait(driver, 10).until(EC.visibility_of_element_located((By.XPATH, AMOUNT_INPUT_XPATH)))
             amount_input.clear()
             amount_input.send_keys(str(amount))
-            self.after(0, lambda: self.update_status(f"Entered amount: {amount}"))
-            # --- ADDED: Check for 'Insufficient coins' badge before confirming ---
-            if trade_type == 'SELL':
-                # Instantly check if the error badge exists. Faster but can be unreliable.
-                insufficient_badge_xpath = "//*[contains(text(), 'Insufficient coins')]"
-                error_elements = driver.find_elements(By.XPATH, insufficient_badge_xpath)
-                if len(error_elements) > 0:
-                    self.after(0, lambda: self.update_status("Trade failed: Insufficient coins.", is_error=True))
-                    return False # Exit the trade flow immediately
+            self.after(0, lambda: self.update_status(f"{log_prefix} Entered amount: {amount}"))
 
             # 4. Click confirm button
             confirm_xpath = CONFIRM_BUTTON_XPATH_TEMPLATE.format(trade_type=trade_type.lower(), token_symbol=token_symbol.lower())
@@ -526,28 +531,19 @@ class TradeApp(tk.Tk):
             driver.execute_script("arguments[0].click();", confirm_button)
 
             # 5. Check for outcome
-            outcome_element = WebDriverWait(driver, 10).until(EC.visibility_of_element_located((By.XPATH, TRADE_OUTCOME_XPATH)))
+            outcome_element = WebDriverWait(driver, 15).until(EC.visibility_of_element_located((By.XPATH, TRADE_OUTCOME_XPATH)))
             if 'successful' in outcome_element.text.lower():
-                self.after(0, lambda: self.update_status("Trade successful!"))
-                trade_successful = True
+                self.after(0, lambda: self.update_status(f"✅ {log_prefix} Trade successful!"))
+                # Wait for the trade dialog to disappear before returning
                 WebDriverWait(driver, 10).until(EC.invisibility_of_element_located((By.XPATH, DIALOG_CONTENT_XPATH)))
+                return True
             else:
-                self.after(0, lambda: self.update_status(f"Trade failed: '{outcome_element.text}'.", is_error=True))
+                self.after(0, lambda: self.update_status(f"❌ {log_prefix} Trade failed: '{outcome_element.text}'.", is_error=True))
+                return False
 
         except Exception as e:
-            self.after(0, lambda e=e: self.update_status(f"Trade failed with exception: {e}", is_error=True))
-
-        finally:
-            # Always refresh balance and UI state afterwards
-            if self.api.is_browser_open():
-                # Run the balance check in a new thread to avoid blocking the current one
-                threading.Thread(target=self._check_balance).start()
-
-            if not (self.sniper_bot_active or self.random_bot_active):
-                 self.after(0, lambda: self.buy_button.config(state=tk.NORMAL))
-                 self.after(0, lambda: self.sell_button.config(state=tk.NORMAL))
-
-        return trade_successful
+            self.after(0, lambda err=e: self.update_status(f"❌ {log_prefix} Trade failed with exception: {err}", is_error=True))
+            return False
 
     def _start_sell_all_thread(self):
         """Starts the sell-all process in a dedicated thread."""
@@ -810,20 +806,25 @@ class TradeApp(tk.Tk):
                 messagebox.showerror("Error", "Browser is not running. Please start it first.")
                 self.sniper_bot_active = False
                 return
-
             if not self.sniper_buy_amount_entry.get() and not self.sniper_buy_percentage.get():
-                messagebox.showerror("Input Error", "Please set a buy amount or select a percentage for the Sniper Bot.")
+                messagebox.showerror("Input Error", "Please set a buy amount or a percentage.")
                 self.sniper_bot_active = False
                 return
 
-            # --- Start Bot: Disable conflicting controls ---
             self.sniper_bot_button.config(text="Stop Sniper Bot")
             self.random_bot_button.config(state=tk.DISABLED)
-            self.notebook.tab(0, state="disabled") # Manual Tab
-            self.notebook.tab(2, state="disabled") # Predicted Tab
+            self.notebook.tab(0, state="disabled")
+            self.notebook.tab(2, state="disabled")
 
-            self.sniper_bot_thread = threading.Thread(target=self._sniper_mode_logic, daemon=True)
-            self.sniper_bot_thread.start()
+            # --- Setup for the hybrid model ---
+            self.snipe_queue = []
+            self.worker_id_counter = itertools.count(1)
+
+            # --- Launch scanner and the NEW buy-only action thread ---
+            self.scanner_thread = threading.Thread(target=self._sniper_scanner_logic, daemon=True)
+            self.buy_thread = threading.Thread(target=self._sniper_buy_logic, daemon=True)
+            self.scanner_thread.start()
+            self.buy_thread.start()
         else:
             # --- Stop Bot: Re-enable all controls ---
             self.sniper_bot_button.config(text="Start Sniper Bot")
@@ -832,192 +833,230 @@ class TradeApp(tk.Tk):
             self.notebook.tab(2, state="normal")
             self.update_status("Sniper Bot Stopped.")
 
-    def _sniper_mode_logic(self):
+    def _sniper_scanner_logic(self):
+        """Finds new coins and adds them to the buy queue."""
         last_seen_coin_symbol = None
-        self.after(0, lambda: self.update_status("[SNIPER] Starting scan for new coins..."))
-
-        initial_coin_data = self.api.get_newest_coin()
-        if initial_coin_data.get("coins"):
-            last_seen_coin_symbol = initial_coin_data["coins"][0].get('symbol')
-            self.after(0, lambda: self.update_status(f"[SNIPER] Current newest coin is {last_seen_coin_symbol}. Monitoring..."))
-        else:
-             self.after(0, lambda: self.update_status("[SNIPER] Could not fetch initial coin. Monitoring..."))
-
+        self.after(0, lambda: self.update_status("[SCANNER] Starting scan for new coins..."))
+        try:
+            initial_coin_data = self.api.get_newest_coin()
+            if initial_coin_data.get("coins"):
+                last_seen_coin_symbol = initial_coin_data["coins"][0].get('symbol')
+        except Exception: pass
 
         while self.sniper_bot_active:
-            time.sleep(1) # Scan every second
-            if not self.sniper_bot_active: break
-
-            newest_coin_data = self.api.get_newest_coin()
-
-            # --- ADDED: Error check for coin scan ---
-            if 'error' in newest_coin_data:
-                self.after(0, lambda: self.update_status(f"[SNIPER] API Error while scanning: {newest_coin_data['error']}", is_error=True))
-                time.sleep(5) # Wait before retrying
-                continue
-
-            current_newest = newest_coin_data.get("coins", [{}])[0].get('symbol') if newest_coin_data.get("coins") else last_seen_coin_symbol
-
-            current_newest = newest_coin_data.get("coins", [{}])[0].get('symbol') if newest_coin_data.get("coins") else last_seen_coin_symbol
-            gui_msg = f"[SNIPER] Monitoring... Newest: {current_newest or 'N/A'}"
-            console_msg = f"Scanning for new coins... Current newest found: {current_newest or 'N/A'}"
-            self.after(0, lambda gm=gui_msg, cm=console_msg: self.update_status(gm, cm))
-
-            if not newest_coin_data.get("coins"): continue
-
-            newest_coin = newest_coin_data["coins"][0]
-            newest_symbol = newest_coin.get('symbol')
-
-            if newest_symbol and newest_symbol != last_seen_coin_symbol:
-                self.after(0, lambda s=newest_symbol: self.update_status(f"[SNIPER] ✨ New coin detected: {s}! ✨"))
-                last_seen_coin_symbol = newest_symbol
-
-                self._execute_snipe(newest_symbol)
-                self.after(0, lambda: self.update_status("[SNIPER] Cycle complete. Resuming scan..."))
-
-    def _execute_snipe(self, token_symbol):
-        buy_amount = 0
-        try:
-            fixed_amount = self.sniper_buy_amount_entry.get()
-            if fixed_amount:
-                buy_amount = int(fixed_amount)
-            else:
-                percentage = float(self.sniper_buy_percentage.get().replace('%', '')) / 100.0
-                balance_str = self.balance_var.get().split('$')[-1]
-                buy_amount = math.floor(float(balance_str) * percentage)
-        except (ValueError, IndexError):
-            self.after(0, lambda: self.update_status("[SNIPER] Invalid buy amount setup. Aborting buy.", is_error=True))
-            return
-
-        if buy_amount < 1:
-            self.after(0, lambda a=buy_amount: self.update_status(f"[SNIPER] Insufficient amount to buy ({a}). Skipping."))
-            return
-
-		# --- CORRECTED LOGIC: Get holder count BEFORE buying to establish a baseline ---
-        self.after(0, lambda: self.update_status(f"[SNIPER] Checking initial holder count for {token_symbol}..."))
-        holders_data_before_buy = self.api.get_token_holders(token_symbol)
-        if 'error' in holders_data_before_buy:
-            self.after(0, lambda: self.update_status(f"[SNIPER] API Error getting initial holders: {holders_data_before_buy['error']}. Aborting snipe.", is_error=True))
-            return
-
-        # This is the number of holders before we have joined.
-        holder_count_before_buy = len(holders_data_before_buy.get('holders', []))
-        self.after(0, lambda c=holder_count_before_buy: self.update_status(f"[SNIPER] Found {c} holders. Proceeding to buy."))
-
-        # --- Execute The Buy ---
-        self.after(0, lambda a=buy_amount: self.update_status(f"[SNIPER] Attempting to buy with ${a}."))
-        buy_successful = self._trade_token_flow(token_symbol, 'BUY', buy_amount)
-        if not buy_successful:
-            self.after(0, lambda: self.update_status(f"[SNIPER] Buy failed for {token_symbol}. Resuming scan."))
-            return
-
-        # --- Monitor for a NEW buyer (someone other than the bot) ---
-        self.after(0, lambda: self.update_status(f"[SNIPER] Buy successful. Monitoring for another buyer..."))
-        monitoring_duration = 180
-        for i in range(monitoring_duration):
-            current_holders_data = self.api.get_token_holders(token_symbol)
-
-            if 'error' in current_holders_data:
-                self.after(0, lambda: self.update_status(f"[SNIPER] API Error updating holders: {current_holders_data['error']}", is_error=True))
-                time.sleep(2) # Wait before retrying on API error
-                continue
-
-            current_holder_count = len(current_holders_data.get('holders', []))
-
-            # We wait for the holder count to be > 1 greater than the original count.
-            # (The first increase is from our own purchase).
-            if current_holder_count > holder_count_before_buy + 1:
-                self.after(0, lambda c=current_holder_count: self.update_status(f"[SNIPER] 🚨 New buyer detected! Holder count is now {c}. Triggering sell."))
-                break # Exit the monitoring loop
-
-            if not self.sniper_bot_active: break
-            time.sleep(2) # Check every 2 seconds
-
-        # --- After monitoring, wait 3 seconds then start the intelligent sell strategy ---
-        self.after(0, lambda: self.update_status(f"[SNIPER] Monitoring finished. Waiting 3s before selling."))
-        time.sleep(3)
-        self._sniper_sell_strategy(token_symbol)
-
-    def _sniper_sell_strategy(self, token_symbol):
-        """
-        Executes a resilient, single-loop sell strategy that correctly waits
-        after clicking the sell tab on every attempt.
-        """
-        self.after(0, lambda: self.update_status(f"[SNIPER] Starting definitive sell strategy for {token_symbol}."))
-        driver = self.selenium_driver
-        coin_page_url = f"{BASE_URL}/coin/{token_symbol}"
-
-        # Main Resilient Selling Loop
-        sell_attempt = 0
-        while self.sniper_bot_active and sell_attempt < 10: # Safety break
-            sell_attempt += 1
-            self.after(0, lambda s=sell_attempt: self.update_status(f"[SNIPER] Sell attempt #{s}."))
-
+            time.sleep(1)
             try:
-                # STEP 1: Always start from a fresh page state
-                driver.get(coin_page_url)
+                newest_coin_data = self.api.get_newest_coin()
+                current_newest = newest_coin_data.get("coins", [{}])[0].get('symbol') if newest_coin_data.get("coins") else last_seen_coin_symbol
+                gui_msg = f"[SNIPER] Monitoring... Newest: {current_newest or 'N/A'}"
+                console_msg = f"Scanning for new coins... Current newest found: {current_newest or 'N/A'}"
+                self.after(0, lambda gm=gui_msg, cm=console_msg: self.update_status(gm, cm))
 
-                # STEP 2: Click the Sell Tab and wait for the panel to load
-                WebDriverWait(driver, 15).until(EC.element_to_be_clickable((By.XPATH, SELL_TAB_XPATH))).click()
-                self.after(0, lambda: self.update_status("[SNIPER] Clicked Sell Tab. Waiting 5 seconds for panel to load..."))
-                time.sleep(5)
+                if newest_coin_data.get("coins"):
+                    newest_symbol = newest_coin_data["coins"][0].get('symbol')
+                    if newest_symbol and newest_symbol != last_seen_coin_symbol:
+                        self.after(0, lambda s=newest_symbol: self.update_status(f"✨ [SCANNER] New coin detected: {s}! Added to buy queue."))
+                        last_seen_coin_symbol = newest_symbol
+                        self.snipe_queue.append(newest_symbol)
+            except Exception:
+                time.sleep(2)
+                continue
 
-                # STEP 3: Scrape the panel
-                parent_div_xpath = "//input[@type='number' and @placeholder='0.00']/ancestor::div[2]"
-                panel_element = WebDriverWait(driver, 10).until(EC.visibility_of_element_located((By.XPATH, parent_div_xpath)))
-                panel_text = panel_element.text
+    def _sniper_buy_logic(self):
+        """Processes the buy queue sequentially using the fast main browser."""
+        self.after(0, lambda: self.update_status("[BUY-THREAD] Waiting for coins in queue..."))
+        while self.sniper_bot_active:
+            if self.snipe_queue:
+                token_symbol = self.snipe_queue.pop(0)
+                log_prefix = f"[BUY-THREAD:{token_symbol}]"
+                self.after(0, lambda: self.update_status(f"{log_prefix} Processing buy..."))
 
-                # STEP 4: Format and Log Scraped Info
-                parts = panel_text.split()
-                available_text = next((f"{parts[i+1]}" for i, x in enumerate(parts) if x == "Available:"), "Not Found")
-                max_sellable_text = next((f"{parts[i+1]} (pool limit)" for i, x in enumerate(parts) if x == "sellable:"), "Not Found")
-                debug_string = f"Available: {available_text} --- Max sellable: {max_sellable_text}"
-                self.after(0, lambda: self.update_status(f"[DEBUG] SCRAPED -> {debug_string}"))
+                try:
+                    buy_amount = 0
+                    fixed_amount = self.sniper_buy_amount_entry.get()
+                    if fixed_amount:
+                        buy_amount = int(fixed_amount)
+                    else:
+                        percentage = float(self.sniper_buy_percentage.get().replace('%', '')) / 100.0
+                        balance_str = self.balance_var.get().split('$')[-1]
+                        buy_amount = math.floor(float(balance_str) * percentage)
 
-                # STEP 5: Make a Decision and Act
-                if "Max sellable" in panel_text:
-                    self.after(0, lambda: self.update_status("[SNIPER] Action: Pool limit detected. Performing max sell."))
-                    WebDriverWait(driver, 5).until(EC.element_to_be_clickable((By.XPATH, MAX_BUTTON_XPATH))).click()
+                    if buy_amount < 1:
+                        self.after(0, lambda a=buy_amount: self.update_status(f"{log_prefix} Insufficient amount ({a}). Skipping."))
+                        continue
 
-                elif "Available" in panel_text:
-                    self.after(0, lambda: self.update_status("[SNIPER] Action: No pool limit. Performing final 50% sale."))
-                    available_amount_val = float(available_text.replace(',', ''))
-                    final_amount = math.floor(available_amount_val * 0.50)
+                    # Execute the buy using the main driver
+                    buy_successful = self._trade_token_flow(token_symbol, 'BUY', buy_amount, self.selenium_driver, "BUY-THREAD")
 
-                    if final_amount < 1:
-                        self.after(0, lambda: self.update_status("[SNIPER] Remainder is too small to sell. Ending cycle."))
-                        break
+                    if buy_successful:
+                        # --- Launch the parallel post-buy worker ---
+                        worker_id = next(self.worker_id_counter)
+                        self.after(0, lambda s=token_symbol, w_id=worker_id: self.update_status(f"✅ {log_prefix} Buy successful! Spawning Worker-{w_id} for monitoring."))
 
-                    amount_input_element = driver.find_element(By.XPATH, AMOUNT_INPUT_XPATH)
-                    amount_input_element.clear()
-                    amount_input_element.send_keys(str(final_amount))
-                else:
-                    raise Exception("Could not understand sell panel.")
+                        worker_thread = threading.Thread(target=self._snipe_post_buy_worker, args=(token_symbol, worker_id), daemon=True)
+                        worker_thread.start()
+                    else:
+                        self.after(0, lambda: self.update_status(f"❌ {log_prefix} Buy failed."))
 
-                # Confirm the sell
-                confirm_button = WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.XPATH, CONFIRM_SELL_BUTTON_XPATH_TEMPLATE.format(token_symbol=token_symbol.lower()))))
-                driver.execute_script("arguments[0].click();", confirm_button)
+                except Exception as e:
+                    self.after(0, lambda err=e: self.update_status(f"❌ {log_prefix} Critical buy error: {err}", is_error=True))
+            else:
+                time.sleep(0.2)
 
-                # Check and log the outcome
-                outcome_element = WebDriverWait(driver, 15).until(EC.visibility_of_element_located((By.XPATH, TRADE_OUTCOME_XPATH)))
-                outcome_text = outcome_element.text
-                if 'successful' in outcome_text.lower():
-                    self.after(0, lambda o=outcome_text: self.update_status(f"✅ Sell successful: '{o}'"))
-                    WebDriverWait(driver, 10).until(EC.invisibility_of_element_located((By.XPATH, DIALOG_CONTENT_XPATH)))
+    def _snipe_post_buy_worker(self, token_symbol, worker_id):
+        """Monitors and sells a single coin using the robust, UI-scraping sell logic."""
+        worker_name = f"Worker-{worker_id}"
+        log_prefix = f"[{worker_name}:{token_symbol}]"
+        dedicated_driver = None
+        temp_profile_path = ""
+
+        # --- Helper function for recovery, now lives inside the worker ---
+        def recover_with_hard_reload(driver, thread_api, reason=""):
+            self.after(0, lambda r=reason: self.update_status(f"⚠️ {log_prefix} {r}. Initiating recovery..."))
+            if not driver or not thread_api.is_browser_open():
+                self.after(0, lambda: self.update_status(f"{log_prefix} Browser not found during recovery.", is_error=True))
+                return False
+            try:
+                coin_page_url = f"{BASE_URL}/coin/{token_symbol}"
+                if driver.current_url != coin_page_url:
+                    driver.get(coin_page_url)
+
+                driver.execute_cdp_cmd('Storage.clearDataForOrigin', {
+                    'origin': BASE_URL,
+                    'storageTypes': 'appcache,cache_storage,file_systems,indexeddb,shader_cache,websql'
+                })
+                driver.execute_cdp_cmd('ServiceWorker.enable', {})
+                driver.execute_cdp_cmd('ServiceWorker.stopAllWorkers', {})
+                driver.execute_cdp_cmd('Network.setCacheDisabled', {'cacheDisabled': True})
+                driver.execute_cdp_cmd('Page.reload', {'ignoreCache': True})
+
+                WebDriverWait(driver, 15).until(EC.element_to_be_clickable((By.XPATH, SELL_TAB_XPATH)))
+                self.after(0, lambda: self.update_status(f"✅ {log_prefix} Recovery successful. Page is ready."))
+                return True
+            except Exception as e:
+                self.after(0, lambda err=e: self.update_status(f"❌ {log_prefix} Recovery failed: {err}", is_error=True))
+                return False
+
+        try:
+            # 1. Setup browser clone
+            self.after(0, lambda: self.update_status(f"🛠️ {log_prefix} Cloning profile..."))
+            source_profile = CHROME_USER_DATA_DIR
+            temp_profile_path = tempfile.mkdtemp(suffix=f"_worker_{worker_id}")
+            ignore_patterns = shutil.ignore_patterns('Singleton*', 'lockfile')
+            shutil.copytree(source_profile, temp_profile_path, dirs_exist_ok=True, ignore=ignore_patterns)
+
+            options = Options()
+            options.add_argument("--no-sandbox")
+            options.add_argument(f"--user-data-dir={temp_profile_path}")
+            options.add_argument("--window-size=1280,720")
+            if not DEBUG_MODE:
+                options.add_argument("--headless=new")
+
+            service = Service(CHROMEDRIVER_PATH)
+            dedicated_driver = webdriver.Chrome(service=service, options=options)
+            thread_api = RugplayAPI(dedicated_driver)
+
+            dedicated_driver.get(BASE_URL)
+            WebDriverWait(dedicated_driver, 15).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+            self.after(0, lambda: self.update_status(f"✅ {log_prefix} Worker browser ready. Starting monitoring..."))
+
+            # 2. Monitor for new buyers
+            monitoring_duration = 180
+            new_buyer_found = False
+            initial_holders_data = thread_api.get_token_holders(token_symbol)
+            if 'error' in initial_holders_data:
+                raise Exception(f"API error getting initial holders: {initial_holders_data['error']}")
+
+            target_holder_count = len(initial_holders_data.get('holders', [])) + 1
+
+            for i in range(monitoring_duration):
+                if not self.sniper_bot_active: break
+                current_holders_data = thread_api.get_token_holders(token_symbol)
+                if 'error' in current_holders_data:
+                    time.sleep(1)
+                    continue
+
+                current_holder_count = len(current_holders_data.get('holders', []))
+                time_left = monitoring_duration - i
+                self.after(0, lambda: self.update_status(f"{log_prefix} Monitoring... {time_left}s left | Holders: {current_holder_count}/{target_holder_count}"))
+
+                if current_holder_count >= target_holder_count:
+                    self.after(0, lambda c=current_holder_count: self.update_status(f"✅ {log_prefix} New buyer detected! Holders: {c}."))
+                    new_buyer_found = True
+                    break
+                time.sleep(1)
+
+            if not new_buyer_found:
+                self.after(0, lambda: self.update_status(f"{log_prefix} Monitoring timed out. Selling anyway."))
+
+            # --- START OF CORRECTED SELL LOGIC ---
+            self.after(0, lambda: self.update_status(f"⏳ {log_prefix} Pausing before sell-off..."))
+            time.sleep(1)
+
+            if not recover_with_hard_reload(dedicated_driver, thread_api, "Preparing for sell-off"): return
+
+            sell_attempt = 0
+            while self.sniper_bot_active and sell_attempt < 10:
+                sell_attempt += 1
+                self.after(0, lambda s=sell_attempt: self.update_status(f"{log_prefix} Sell attempt #{s}."))
+                try:
+                    sell_tab_button = WebDriverWait(dedicated_driver, 15).until(EC.element_to_be_clickable((By.XPATH, SELL_TAB_XPATH)))
+                    sell_tab_button.click()
+
+                    panel_element = WebDriverWait(dedicated_driver, 10).until(EC.visibility_of_element_located((By.XPATH, "//input[@type='number' and @placeholder='0.00']/ancestor::div[2]")))
+                    panel_text = panel_element.text
+                    parts = panel_text.split()
+                    available_text = next((f"{parts[i+1]}" for i, x in enumerate(parts) if x == "Available:"), "Not Found")
+                    max_sellable_text = next((f"{parts[i+1]}" for i, x in enumerate(parts) if x == "sellable:"), "Not Found")
+                    self.after(0, lambda: self.update_status(f"[DEBUG] {log_prefix} SCRAPED -> Available: {available_text} | Max sellable: {max_sellable_text}"))
 
                     if "Max sellable" in panel_text:
-                        continue # If it was a max sell, loop to sell the next chunk
+                        self.after(0, lambda: self.update_status(f"{log_prefix} Action: Pool limit detected. Selling max."))
+                        WebDriverWait(dedicated_driver, 5).until(EC.element_to_be_clickable((By.XPATH, MAX_BUTTON_XPATH))).click()
+                    elif "Available" in panel_text:
+                        self.after(0, lambda: self.update_status(f"{log_prefix} Action: No pool limit. Selling 50%."))
+                        available_amount_val = float(available_text.replace(',', ''))
+                        final_amount = math.floor(available_amount_val * 0.50)
+                        if final_amount < 1:
+                            self.after(0, lambda: self.update_status(f"{log_prefix} Remainder too small. Ending cycle."))
+                            break
+                        amount_input_element = dedicated_driver.find_element(By.XPATH, AMOUNT_INPUT_XPATH)
+                        amount_input_element.clear()
+                        amount_input_element.send_keys(str(final_amount))
                     else:
-                        break # If it was the final 50% sale, we are done
-                else:
-                    raise Exception(f"Trade failed with message: '{outcome_text}'")
+                        raise Exception("Could not find 'Available' or 'Max sellable' text.")
 
-            except Exception as e:
-                self.after(0, lambda err=e: self.update_status(f"[SNIPER] Error during attempt #{sell_attempt}: {err}. Retrying loop.", is_error=True))
-                time.sleep(5)
-                continue # On any error, wait and retry the whole process
+                    confirm_button = WebDriverWait(dedicated_driver, 10).until(EC.element_to_be_clickable((By.XPATH, CONFIRM_SELL_BUTTON_XPATH_TEMPLATE.format(token_symbol=token_symbol.lower()))))
+                    dedicated_driver.execute_script("arguments[0].click();", confirm_button)
 
-        self.after(0, lambda: self.update_status(f"[SNIPER] Finished sell strategy for {token_symbol}. Resuming scan."))
+                    outcome_element = WebDriverWait(dedicated_driver, 15).until(EC.visibility_of_element_located((By.XPATH, TRADE_OUTCOME_XPATH)))
+                    outcome_text = outcome_element.text
+                    if 'successful' in outcome_text.lower():
+                        self.after(0, lambda o=outcome_text: self.update_status(f"✅ {log_prefix} Sell successful: '{o}'"))
+                        WebDriverWait(dedicated_driver, 10).until(EC.invisibility_of_element_located((By.XPATH, DIALOG_CONTENT_XPATH)))
+                        if "Max sellable" in panel_text:
+                            self.after(0, lambda: self.update_status(f"{log_prefix} Pool limit sell complete. Re-evaluating..."))
+                            time.sleep(1)
+                            continue
+                        else:
+                            break
+                    else:
+                        raise Exception(f"Trade failed with message: '{outcome_text}'")
+                except Exception as e:
+                    if not recover_with_hard_reload(dedicated_driver, thread_api, f"Error on sell attempt #{sell_attempt}: {e}"):
+                        return
+                    continue
+            # --- END OF CORRECTED SELL LOGIC ---
+
+        except Exception as e:
+            self.after(0, lambda err=e: self.update_status(f"❌ {log_prefix} Worker error: {err}", is_error=True))
+        finally:
+            if dedicated_driver:
+                dedicated_driver.quit()
+            if temp_profile_path and os.path.exists(temp_profile_path):
+                shutil.rmtree(temp_profile_path, ignore_errors=True)
+            self.after(0, lambda: self.update_status(f"🗑️ {log_prefix} Worker finished and cleaned up."))
+
 
 
 
