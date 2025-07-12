@@ -893,70 +893,140 @@ class TradeApp(tk.Tk):
             self.after(0, lambda a=buy_amount: self.update_status(f"[SNIPER] Insufficient amount to buy ({a}). Skipping."))
             return
 
+		# --- CORRECTED LOGIC: Get holder count BEFORE buying to establish a baseline ---
+        self.after(0, lambda: self.update_status(f"[SNIPER] Checking initial holder count for {token_symbol}..."))
+        holders_data_before_buy = self.api.get_token_holders(token_symbol)
+        if 'error' in holders_data_before_buy:
+            self.after(0, lambda: self.update_status(f"[SNIPER] API Error getting initial holders: {holders_data_before_buy['error']}. Aborting snipe.", is_error=True))
+            return
+
+        # This is the number of holders before we have joined.
+        holder_count_before_buy = len(holders_data_before_buy.get('holders', []))
+        self.after(0, lambda c=holder_count_before_buy: self.update_status(f"[SNIPER] Found {c} holders. Proceeding to buy."))
+
+        # --- Execute The Buy ---
         self.after(0, lambda a=buy_amount: self.update_status(f"[SNIPER] Attempting to buy with ${a}."))
         buy_successful = self._trade_token_flow(token_symbol, 'BUY', buy_amount)
         if not buy_successful:
             self.after(0, lambda: self.update_status(f"[SNIPER] Buy failed for {token_symbol}. Resuming scan."))
             return
 
+        # --- Monitor for a NEW buyer (someone other than the bot) ---
+        self.after(0, lambda: self.update_status(f"[SNIPER] Buy successful. Monitoring for another buyer..."))
         monitoring_duration = 180
-        new_buyer_found = False
-        holders_data = self.api.get_token_holders(token_symbol)
-
-        # --- ADDED: Error check for initial holders scan ---
-        if 'error' in holders_data:
-            self.after(0, lambda: self.update_status(f"[SNIPER] API Error getting holders: {holders_data['error']}", is_error=True))
-            initial_holder_count = 0
-        else:
-            initial_holder_count = len(holders_data.get('holders', []))
-
-
         for i in range(monitoring_duration):
-# ...
-            if i > 0:
-                current_holders_data = self.api.get_token_holders(token_symbol)
-                # --- ADDED: Error check for subsequent holders scan ---
-                if 'error' in current_holders_data:
-                    self.after(0, lambda: self.update_status(f"[SNIPER] API Error updating holders: {current_holders_data['error']}", is_error=True))
-                    continue # Skip this check and try again
-                current_holder_count = len(current_holders_data.get('holders', []))
-                if current_holder_count > initial_holder_count:
-                    new_buyer_found = True
-                    self.after(0, lambda: self.update_status(f"[SNIPER] 🚨 New buyer detected for {token_symbol}!"))
-                    break
+            current_holders_data = self.api.get_token_holders(token_symbol)
 
-        self._check_balance() # Refresh holdings
-        time.sleep(1) # Allow state to update
+            if 'error' in current_holders_data:
+                self.after(0, lambda: self.update_status(f"[SNIPER] API Error updating holders: {current_holders_data['error']}", is_error=True))
+                time.sleep(2) # Wait before retrying on API error
+                continue
 
-        holding = next((h for h in self.current_coin_holdings if h.get("symbol") == token_symbol), None)
-        if not holding or float(holding.get("quantity", 0)) < 1:
-            self.after(0, lambda: self.update_status(f"[SNIPER] No holdings of {token_symbol} found to sell."))
-            return
+            current_holder_count = len(current_holders_data.get('holders', []))
 
-        holding_quantity = float(holding.get("quantity"))
-        sell_percentage = 0.80 if new_buyer_found else 0.90
-        total_sell_amount = math.floor(holding_quantity * sell_percentage)
-        num_batches = 4
+            # We wait for the holder count to be > 1 greater than the original count.
+            # (The first increase is from our own purchase).
+            if current_holder_count > holder_count_before_buy + 1:
+                self.after(0, lambda c=current_holder_count: self.update_status(f"[SNIPER] 🚨 New buyer detected! Holder count is now {c}. Triggering sell."))
+                break # Exit the monitoring loop
 
-        if total_sell_amount < 1: return # Nothing to sell
+            if not self.sniper_bot_active: break
+            time.sleep(2) # Check every 2 seconds
 
-        if total_sell_amount < num_batches: # Sell all at once if amount is small
-            self._trade_token_flow(token_symbol, 'SELL', total_sell_amount)
-        else: # Sell in batches
-            batch_size = math.floor(total_sell_amount / num_batches)
-            amount_sold = 0
-            for i in range(num_batches):
-                if not self.sniper_bot_active: break
-                current_batch = batch_size if i < num_batches - 1 else total_sell_amount - amount_sold
-                if current_batch < 1: continue
+        # --- After monitoring, wait 3 seconds then start the intelligent sell strategy ---
+        self.after(0, lambda: self.update_status(f"[SNIPER] Monitoring finished. Waiting 3s before selling."))
+        time.sleep(3)
+        self._sniper_sell_strategy(token_symbol)
 
-                self.after(0, lambda b=i+1, n=num_batches, a=current_batch: self.update_status(f"[SNIPER] Selling batch {b}/{n}: {a} tokens."))
-                if self._trade_token_flow(token_symbol, 'SELL', current_batch):
-                    amount_sold += current_batch
-                    time.sleep(random.randint(1,2))
+    def _sniper_sell_strategy(self, token_symbol):
+        """
+        Executes a resilient, single-loop sell strategy that correctly waits
+        after clicking the sell tab on every attempt.
+        """
+        self.after(0, lambda: self.update_status(f"[SNIPER] Starting definitive sell strategy for {token_symbol}."))
+        driver = self.selenium_driver
+        coin_page_url = f"{BASE_URL}/coin/{token_symbol}"
+
+        # Main Resilient Selling Loop
+        sell_attempt = 0
+        while self.sniper_bot_active and sell_attempt < 10: # Safety break
+            sell_attempt += 1
+            self.after(0, lambda s=sell_attempt: self.update_status(f"[SNIPER] Sell attempt #{s}."))
+
+            try:
+                # STEP 1: Always start from a fresh page state
+                driver.get(coin_page_url)
+
+                # STEP 2: Click the Sell Tab and wait for the panel to load
+                WebDriverWait(driver, 15).until(EC.element_to_be_clickable((By.XPATH, SELL_TAB_XPATH))).click()
+                self.after(0, lambda: self.update_status("[SNIPER] Clicked Sell Tab. Waiting 5 seconds for panel to load..."))
+                time.sleep(5)
+
+                # STEP 3: Scrape the panel
+                parent_div_xpath = "//input[@type='number' and @placeholder='0.00']/ancestor::div[2]"
+                panel_element = WebDriverWait(driver, 10).until(EC.visibility_of_element_located((By.XPATH, parent_div_xpath)))
+                panel_text = panel_element.text
+
+                # STEP 4: Format and Log Scraped Info
+                parts = panel_text.split()
+                available_text = next((f"{parts[i+1]}" for i, x in enumerate(parts) if x == "Available:"), "Not Found")
+                max_sellable_text = next((f"{parts[i+1]} (pool limit)" for i, x in enumerate(parts) if x == "sellable:"), "Not Found")
+                debug_string = f"Available: {available_text} --- Max sellable: {max_sellable_text}"
+                self.after(0, lambda: self.update_status(f"[DEBUG] SCRAPED -> {debug_string}"))
+
+                # STEP 5: Make a Decision and Act
+                if "Max sellable" in panel_text:
+                    self.after(0, lambda: self.update_status("[SNIPER] Action: Pool limit detected. Performing max sell."))
+                    WebDriverWait(driver, 5).until(EC.element_to_be_clickable((By.XPATH, MAX_BUTTON_XPATH))).click()
+
+                elif "Available" in panel_text:
+                    self.after(0, lambda: self.update_status("[SNIPER] Action: No pool limit. Performing final 50% sale."))
+                    available_amount_val = float(available_text.replace(',', ''))
+                    final_amount = math.floor(available_amount_val * 0.50)
+
+                    if final_amount < 1:
+                        self.after(0, lambda: self.update_status("[SNIPER] Remainder is too small to sell. Ending cycle."))
+                        break
+
+                    amount_input_element = driver.find_element(By.XPATH, AMOUNT_INPUT_XPATH)
+                    amount_input_element.clear()
+                    amount_input_element.send_keys(str(final_amount))
                 else:
-                    self.after(0, lambda b=i+1: self.update_status(f"[SNIPER] Batch {b} failed. Aborting sells.", is_error=True))
-                    break
+                    raise Exception("Could not understand sell panel.")
+
+                # Confirm the sell
+                confirm_button = WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.XPATH, CONFIRM_SELL_BUTTON_XPATH_TEMPLATE.format(token_symbol=token_symbol.lower()))))
+                driver.execute_script("arguments[0].click();", confirm_button)
+
+                # Check and log the outcome
+                outcome_element = WebDriverWait(driver, 15).until(EC.visibility_of_element_located((By.XPATH, TRADE_OUTCOME_XPATH)))
+                outcome_text = outcome_element.text
+                if 'successful' in outcome_text.lower():
+                    self.after(0, lambda o=outcome_text: self.update_status(f"✅ Sell successful: '{o}'"))
+                    WebDriverWait(driver, 10).until(EC.invisibility_of_element_located((By.XPATH, DIALOG_CONTENT_XPATH)))
+
+                    if "Max sellable" in panel_text:
+                        continue # If it was a max sell, loop to sell the next chunk
+                    else:
+                        break # If it was the final 50% sale, we are done
+                else:
+                    raise Exception(f"Trade failed with message: '{outcome_text}'")
+
+            except Exception as e:
+                self.after(0, lambda err=e: self.update_status(f"[SNIPER] Error during attempt #{sell_attempt}: {err}. Retrying loop.", is_error=True))
+                time.sleep(5)
+                continue # On any error, wait and retry the whole process
+
+        self.after(0, lambda: self.update_status(f"[SNIPER] Finished sell strategy for {token_symbol}. Resuming scan."))
+
+
+
+
+
+
+
+# ... This is where the next method in the class starts, like _toggle_recent_coins_window ...
+
 
     # --- Window Management & Shutdown ---
     def _toggle_recent_coins_window(self):
