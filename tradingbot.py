@@ -34,7 +34,7 @@ DEBUG_MODE = False
 HEADLESS_MODE = not DEBUG_MODE
 
 # URLs
-BASE_URL = "https://s3rver.nl"
+BASE_URL = "https://rugplay.com"
 PORTFOLIO_API_URL = f"{BASE_URL}/api/portfolio/total"
 MARKET_API_URL = f"{BASE_URL}/api/market?sortBy=createdAt&sortOrder=desc&limit=50"
 NEWEST_COIN_API_URL = f"{BASE_URL}/api/market?sortBy=createdAt&sortOrder=desc&limit=1"
