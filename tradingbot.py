@@ -24,6 +24,7 @@ import os
 import shutil
 import tempfile
 import itertools
+import requests
 
 
 # --- Configuration & Constants ---
@@ -39,6 +40,7 @@ PORTFOLIO_API_URL = f"{BASE_URL}/api/portfolio/total"
 MARKET_API_URL = f"{BASE_URL}/api/market?sortBy=createdAt&sortOrder=desc&limit=50"
 NEWEST_COIN_API_URL = f"{BASE_URL}/api/market?sortBy=createdAt&sortOrder=desc&limit=1"
 HOLDERS_API_URL_TEMPLATE = f"{BASE_URL}/api/coin/{{token_symbol}}/holders?limit=50"
+TRADE_API_URL_TEMPLATE = f"{BASE_URL}/api/coin/{{token_symbol}}/trade"
 
 # XPaths
 DIALOG_CONTENT_XPATH = "//div[@data-slot='dialog-content']"
@@ -111,6 +113,7 @@ class TradeApp(tk.Tk):
         self.api = None
         self.log_history = []
         self.current_coin_holdings = []
+        self.session_cookie = None
 
         # Bot state
         self.sniper_bot_active = False
@@ -127,6 +130,7 @@ class TradeApp(tk.Tk):
         self.update_status("Initializing application...")
         threading.Thread(target=self._run_selenium_thread, args=(True,), daemon=True).start()
         self.protocol("WM_DELETE_WINDOW", self._on_closing)
+
 
     # --- GUI Setup ---
     def _setup_gui(self):
@@ -166,6 +170,163 @@ class TradeApp(tk.Tk):
 
         self.action_button = ttk.Button(dashboard_frame, text="Proceed After Login", command=self._proceed_after_login, state=tk.DISABLED)
         self.action_button.pack(pady=10)
+
+    def _finalize_sell_all_ui(self):
+        """Helper to re-enable UI elements after the sell-all process."""
+        self.after(0, lambda: self.sell_all_button.config(state=tk.NORMAL))
+        self.after(0, lambda: self.buy_button.config(state=tk.NORMAL))
+        self.after(0, lambda: self.sell_button.config(state=tk.NORMAL))
+
+    def _finalize_manual_trade_ui(self):
+        """Helper to re-enable manual trade buttons after a trade attempt."""
+        if self.buy_button and self.buy_button.winfo_exists():
+            self.buy_button.config(state=tk.NORMAL)
+        if self.sell_button and self.sell_button.winfo_exists():
+            self.sell_button.config(state=tk.NORMAL)
+
+
+
+
+    def _force_reload_coin_page(self, driver, token_symbol, log_prefix):
+        """
+        Navigates to the coin page and performs a hard reload, clearing cache
+        to ensure all UI data is fresh before scraping.
+        """
+        self.after(0, lambda: self.update_status(f"🛠️ {log_prefix} Force-reloading page to get fresh data..."))
+        try:
+            # Navigate to the correct page
+            coin_page_url = f"{BASE_URL}/coin/{token_symbol}"
+            if driver.current_url != coin_page_url:
+                driver.get(coin_page_url)
+
+            # Use Chrome DevTools Protocol to clear cache and force reload
+            driver.execute_cdp_cmd('Network.setCacheDisabled', {'cacheDisabled': True})
+            driver.execute_cdp_cmd('Page.reload', {'ignoreCache': True})
+
+            # Wait for the page to be ready after the reload
+            WebDriverWait(driver, 15).until(
+                EC.element_to_be_clickable((By.XPATH, SELL_TAB_XPATH))
+            )
+            self.after(0, lambda: self.update_status(f"✅ {log_prefix} Page reloaded successfully."))
+            return True
+        except Exception as e:
+            self.after(0, lambda err=e: self.update_status(f"❌ {log_prefix} Force reload failed: {err}", is_error=True))
+            return False
+
+
+    def _scrape_and_calculate_sell_amount(self, token_symbol):
+        """
+        Performs a force-reload and then scrapes the UI to determine the optimal
+        sell amount, checking for 'Max sellable' as the priority.
+        """
+        log_prefix = f"[RandomBot:{token_symbol}]"
+        driver = self.selenium_driver
+
+        # 1. Force a hard reload to get fresh data
+        if not self._force_reload_coin_page(driver, token_symbol, log_prefix):
+            return 0 # Return 0 if reload fails
+
+        try:
+            # 2. Scrape the now-fresh data
+            self.after(0, lambda: self.update_status(f"{log_prefix} Scraping fresh sell data..."))
+
+            # Click the 'SELL' tab
+            sell_tab = WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.XPATH, SELL_TAB_XPATH)))
+            driver.execute_script("arguments[0].click();", sell_tab)
+
+            # Scrape the panel text to find "Available" or "Max sellable"
+            panel_element = WebDriverWait(driver, 10).until(EC.visibility_of_element_located((By.XPATH, "//input[@type='number']/ancestor::div[2]")))
+            panel_text = panel_element.text
+            parts = panel_text.split()
+
+            # Check for "Max sellable" first, just like the sniper bot
+            if "Max sellable" in panel_text:
+                max_sellable_text = next((f"{parts[i+1]}" for i, x in enumerate(parts) if x == "sellable:"), "0")
+                amount = float(max_sellable_text.replace(',', ''))
+                self.after(0, lambda a=amount: self.update_status(f"{log_prefix} Pool limit detected. Selling max: {a}"))
+                return amount
+
+            # Fallback to "Available" if no pool limit
+            elif "Available" in panel_text:
+                available_text = next((f"{parts[i+1]}" for i, x in enumerate(parts) if x == "Available:"), "0")
+                available_amount = float(available_text.replace(',', ''))
+                sell_percentage = random.uniform(0.20, 0.95)
+                amount = math.floor(available_amount * sell_percentage)
+                self.after(0, lambda p=int(sell_percentage*100), a=amount: self.update_status(f"{log_prefix} No limit. Selling {p}% ({a})"))
+                return amount
+            else:
+                self.after(0, lambda: self.update_status(f"{log_prefix} Could not find sellable amount on page.", is_error=True))
+                return 0
+        except Exception as e:
+            self.after(0, lambda err=e: self.update_status(f"{log_prefix} Failed to scrape sell amount after reload: {err}", is_error=True))
+            return 0
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    def _trade_via_api(self, token_symbol, trade_type, amount, worker_name="API", on_complete=None):
+        """Executes a trade using the direct API endpoint."""
+        log_prefix = f"[{worker_name}:{token_symbol}]"
+        self.after(0, lambda: self.update_status(f"{log_prefix} Firing {trade_type} API for {amount}..."))
+
+        trade_successful = False
+        try:
+            if not self.session_cookie:
+                self.after(0, lambda: self.update_status(f"❌ {log_prefix} Trade failed: No session cookie.", is_error=True))
+                return False
+
+            url = TRADE_API_URL_TEMPLATE.format(token_symbol=token_symbol)
+            headers = {
+                'User-Agent': USER_AGENT,
+                'Content-Type': 'application/json',
+                'Origin': BASE_URL,
+                'Referer': f'{BASE_URL}/coin/{token_symbol}',
+                'Cookie': self.session_cookie
+            }
+            payload = {"type": trade_type.upper(), "amount": float(amount)}
+
+            try:
+                response = requests.post(url, headers=headers, json=payload, timeout=15)
+
+                if response.status_code in [200, 204] and not response.text:
+                    self.after(0, lambda: self.update_status(f"✅ {log_prefix} Trade successful (No Content response)."))
+                    threading.Thread(target=self._check_balance).start()
+                    trade_successful = True
+                else:
+                    response_data = response.json()
+                    if response.status_code == 200 and response_data.get('success'):
+                        self.after(0, lambda: self.update_status(f"✅ {log_prefix} Trade successful!"))
+                        threading.Thread(target=self._check_balance).start()
+                        trade_successful = True
+                    else:
+                        error_msg = response_data.get('message', response.text)
+                        self.after(0, lambda: self.update_status(f"❌ {log_prefix} Trade failed: '{error_msg}'.", is_error=True))
+            except requests.exceptions.RequestException as e:
+                self.after(0, lambda err=e: self.update_status(f"❌ {log_prefix} Trade request error: {err}", is_error=True))
+            except json.JSONDecodeError:
+                self.after(0, lambda: self.update_status(f"❌ {log_prefix} Trade failed: Invalid JSON in response: {response.text}", is_error=True))
+
+        finally:
+            # FIX: Execute the on_complete callback to re-enable UI elements
+            if on_complete:
+                self.after(0, on_complete)
+            return trade_successful
 
     def _create_notebook(self, parent):
         notebook = ttk.Notebook(parent)
@@ -267,9 +428,18 @@ class TradeApp(tk.Tk):
         tab.columnconfigure(0, weight=1)
         tab.rowconfigure(0, weight=1)
 
+        config_frame = ttk.LabelFrame(tab, text="Configuration", padding=10)
+        config_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        config_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(config_frame, text="Max Buy (USD):").grid(row=0, column=0, padx=5, pady=5, sticky="w")
+        self.random_max_buy_entry = ttk.Entry(config_frame, width=15)
+        self.random_max_buy_entry.grid(row=0, column=1, padx=5, pady=5, sticky="w")
+        self.random_max_buy_entry.insert(0, "10") # Default value
+
         self.random_bot_button = ttk.Button(tab, text="Start Random Bot", command=self._toggle_random_bot, state=tk.DISABLED)
-        self.random_bot_button.grid(row=0, column=0, pady=20)
-        ttk.Label(tab, text="Note: Select a token in the 'Manual' tab first.").grid(row=1, column=0, pady=5)
+        self.random_bot_button.grid(row=1, column=0, pady=20)
+        ttk.Label(tab, text="Note: Select a token in the 'Manual' tab first.").grid(row=2, column=0, pady=5)
         return tab
 
     def _create_bottom_controls(self, parent):
@@ -439,6 +609,21 @@ class TradeApp(tk.Tk):
             self.action_button.config(state=tk.NORMAL)
             return
 
+        # --- CAPTURE SESSION COOKIE ---
+        try:
+            cookies = self.selenium_driver.get_cookies()
+            if not cookies:
+                self.update_status("Could not retrieve session cookie. Please try again.", is_error=True)
+                self.action_button.config(state=tk.NORMAL)
+                return
+            self.session_cookie = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
+            self.update_status("Session cookie captured successfully.", "Auth cookie stored.")
+        except Exception as e:
+            self.update_status(f"Error capturing cookie: {e}", is_error=True)
+            self.action_button.config(state=tk.NORMAL)
+            return
+        # --- END OF COOKIE CAPTURE ---
+
         self._update_balance_labels(portfolio_data)
         self._populate_token_dropdown(portfolio_data.get("coinHoldings", []))
 
@@ -488,62 +673,64 @@ class TradeApp(tk.Tk):
         self.buy_button.config(state=tk.DISABLED)
         self.sell_button.config(state=tk.DISABLED)
 
-        # --- FIX: Pass the main driver and a name for manual trades ---
-        threading.Thread(target=self._trade_token_flow, args=(token_symbol, trade_type, amount, self.selenium_driver, "Manual")).start()
+        # --- Check Debug Mode ---
+        if DEBUG_MODE:
+            self.update_status(f"[DEBUG] Using UI method for {trade_type} {token_symbol}.")
+            threading.Thread(target=self._trade_token_flow, args=(token_symbol, trade_type, amount, self.selenium_driver, "Manual")).start()
+        else:
+            # Pass the callback function to re-enable the buttons on completion
+            threading.Thread(target=self._trade_via_api, args=(token_symbol, trade_type, amount, "Manual", self._finalize_manual_trade_ui)).start()
+        # --- End Check ---
+        # The incorrect self.after(3000, ...) lines have been removed.
 
-        # Re-enable buttons after a short delay to prevent spamming
-        self.after(3000, lambda: self.buy_button.config(state=tk.NORMAL))
-        self.after(3000, lambda: self.sell_button.config(state=tk.NORMAL))
 
     def _trade_token_flow(self, token_symbol, trade_type, amount, driver, worker_name="Manual"):
-
         log_prefix = f"[{worker_name}:{token_symbol}]"
         self.after(0, lambda: self.update_status(f"{log_prefix} Starting {trade_type} for {amount}..."))
 
+        trade_successful = False
         try:
-            # 1. Navigate to the correct coin page within the specified driver
             coin_page_url = f"{BASE_URL}/coin/{token_symbol}"
-            # Only navigate if not already there to save time
             if driver.current_url != coin_page_url:
                 self.after(0, lambda: self.update_status(f"{log_prefix} Navigating to coin page..."))
                 driver.get(coin_page_url)
 
-            # Wait for a key element to ensure the page is interactive
             WebDriverWait(driver, 15).until(
                 EC.element_to_be_clickable((By.XPATH, TRADE_BUTTON_XPATH_TEMPLATE.format(trade_type='buy')))
             )
 
-            # 2. Click BUY/SELL tab
             trade_button_xpath = TRADE_BUTTON_XPATH_TEMPLATE.format(trade_type=trade_type.lower())
             trade_button = WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.XPATH, trade_button_xpath)))
             trade_button.click()
             self.after(0, lambda: self.update_status(f"{log_prefix} Clicked '{trade_type.upper()}' tab."))
 
-            # 3. Enter amount
             amount_input = WebDriverWait(driver, 10).until(EC.visibility_of_element_located((By.XPATH, AMOUNT_INPUT_XPATH)))
             amount_input.clear()
             amount_input.send_keys(str(amount))
             self.after(0, lambda: self.update_status(f"{log_prefix} Entered amount: {amount}"))
 
-            # 4. Click confirm button
             confirm_xpath = CONFIRM_BUTTON_XPATH_TEMPLATE.format(trade_type=trade_type.lower(), token_symbol=token_symbol.lower())
             confirm_button = WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.XPATH, confirm_xpath)))
             driver.execute_script("arguments[0].click();", confirm_button)
 
-            # 5. Check for outcome
-            outcome_element = WebDriverWait(driver, 15).until(EC.visibility_of_element_located((By.XPATH, TRADE_OUTCOME_XPATH)))
+            outcome_element = WebDriverWait(driver, 15).until(EC.visibility_of_element_located((By.XPATH, "//*[contains(text(), 'successful') or contains(text(), 'failed')]")))
             if 'successful' in outcome_element.text.lower():
                 self.after(0, lambda: self.update_status(f"✅ {log_prefix} Trade successful!"))
-                # Wait for the trade dialog to disappear before returning
                 WebDriverWait(driver, 10).until(EC.invisibility_of_element_located((By.XPATH, DIALOG_CONTENT_XPATH)))
-                return True
+                trade_successful = True
             else:
                 self.after(0, lambda: self.update_status(f"❌ {log_prefix} Trade failed: '{outcome_element.text}'.", is_error=True))
-                return False
 
         except Exception as e:
             self.after(0, lambda err=e: self.update_status(f"❌ {log_prefix} Trade failed with exception: {err}", is_error=True))
-            return False
+
+        finally:
+            # FIX: Only re-enable buttons if it was a manual trade
+            if worker_name == "Manual":
+                self.after(0, self._finalize_manual_trade_ui)
+            return trade_successful
+
+
 
     def _start_sell_all_thread(self):
         """Starts the sell-all process in a dedicated thread."""
@@ -560,7 +747,12 @@ class TradeApp(tk.Tk):
             self.after(0, lambda: self.update_status("Sell All failed: Browser not open.", is_error=True))
             return
 
-        # 1. Fetch tokens from portfolio
+        # Check for session cookie if not in debug mode
+        if not DEBUG_MODE and not self.session_cookie:
+            self.after(0, lambda: self.update_status("Sell All failed: API session not ready.", is_error=True))
+            self._finalize_sell_all_ui()
+            return
+
         self.after(0, lambda: self.update_status("Fetching portfolio for sell-all...", "Requesting portfolio API."))
         portfolio_data = self.api.get_portfolio()
         if 'error' in portfolio_data:
@@ -569,25 +761,27 @@ class TradeApp(tk.Tk):
             return
 
         holdings = portfolio_data.get("coinHoldings", [])
-        tokens_to_sell = [h['symbol'] for h in holdings if h.get('symbol') and float(h.get('quantity', 0)) > 0.0001]
+        tokens_to_sell = [(h['symbol'], float(h.get('quantity', 0))) for h in holdings if h.get('symbol') and float(h.get('quantity', 0)) > 0.0001]
 
         if not tokens_to_sell:
-            self.after(0, lambda: self.update_status("Portfolio is empty. Nothing to sell.", "No tokens found to liquidate."))
+            self.after(0, lambda: self.update_status("Portfolio is empty. Nothing to sell."))
             self._finalize_sell_all_ui()
             return
 
-        self.after(0, lambda: self.update_status(f"Found {len(tokens_to_sell)} tokens to sell.", f"Tokens: {', '.join(tokens_to_sell)}"))
+        self.after(0, lambda: self.update_status(f"Found {len(tokens_to_sell)} tokens to sell."))
 
-        # 2. Loop through and sell each token
-        for token in tokens_to_sell:
-            self.after(0, lambda t=token: self.update_status(f"Now processing: {t}"))
-            self._sell_max_for_token(self.selenium_driver, token)
-            # Short pause between tokens
+        for token_symbol, quantity in tokens_to_sell:
+            # --- Check Debug Mode ---
+            if DEBUG_MODE:
+                self.after(0, lambda t=token_symbol: self.update_status(f"[DEBUG] Using UI method to sell {t}"))
+                self._sell_max_for_token(self.selenium_driver, token_symbol)
+            else:
+                self.after(0, lambda t=token_symbol, q=quantity: self.update_status(f"Selling all {q} of {t} via API"))
+                self._trade_via_api(token_symbol, 'SELL', quantity, "SellAll")
+            # --- End Check ---
             time.sleep(1)
 
-        self.after(0, lambda: self.update_status("✅ Sell All process complete.", "All tokens have been processed."))
-
-        # 3. Refresh balance and UI
+        self.after(0, lambda: self.update_status("✅ Sell All process complete."))
         threading.Thread(target=self._check_balance).start()
         self._finalize_sell_all_ui()
 
@@ -600,28 +794,22 @@ class TradeApp(tk.Tk):
                 self.after(0, lambda: driver.get(coin_page_url))
                 WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
 
-            short_timeout = 5
-
-            self.after(0, lambda: self.update_status("Clicking 'Sell' tab..."))
-            sell_tab = WebDriverWait(driver, short_timeout).until(EC.element_to_be_clickable((By.XPATH, SELL_TAB_XPATH)))
+            sell_tab = WebDriverWait(driver, 5).until(EC.element_to_be_clickable((By.XPATH, SELL_TAB_XPATH)))
             driver.execute_script("arguments[0].click();", sell_tab)
 
-            self.after(0, lambda: self.update_status("Clicking 'Max' button..."))
-            max_button = WebDriverWait(driver, short_timeout).until(EC.element_to_be_clickable((By.XPATH, MAX_BUTTON_XPATH)))
+            max_button = WebDriverWait(driver, 5).until(EC.element_to_be_clickable((By.XPATH, MAX_BUTTON_XPATH)))
             driver.execute_script("arguments[0].click();", max_button)
 
-            self.after(0, lambda: self.update_status("Clicking confirmation button..."))
             confirm_xpath = CONFIRM_SELL_BUTTON_XPATH_TEMPLATE.format(token_symbol=token_symbol.lower())
-            confirm_button = WebDriverWait(driver, short_timeout).until(EC.element_to_be_clickable((By.XPATH, confirm_xpath)))
+            confirm_button = WebDriverWait(driver, 5).until(EC.element_to_be_clickable((By.XPATH, confirm_xpath)))
             driver.execute_script("arguments[0].click();", confirm_button)
 
-            self.after(0, lambda: self.update_status("Waiting for trade outcome..."))
-            outcome_element = WebDriverWait(driver, 15).until(EC.visibility_of_element_located((By.XPATH, TRADE_OUTCOME_XPATH)))
+            outcome_element = WebDriverWait(driver, 15).until(EC.visibility_of_element_located((By.XPATH, "//*[contains(text(), 'successful') or contains(text(), 'failed')]")))
             outcome_text = outcome_element.text
 
             if 'successful' in outcome_text.lower():
                 self.after(0, lambda t=token_symbol, o=outcome_text: self.update_status(f"✅ SELL SUCCESSFUL for {t}. Message: '{o}'"))
-                WebDriverWait(driver, short_timeout).until(EC.invisibility_of_element_located((By.XPATH, DIALOG_CONTENT_XPATH)))
+                WebDriverWait(driver, 5).until(EC.invisibility_of_element_located((By.XPATH, DIALOG_CONTENT_XPATH)))
             else:
                 self.after(0, lambda t=token_symbol, o=outcome_text: self.update_status(f"❌ SELL FAILED for {t}. Message: '{o}'.", is_error=True))
 
@@ -630,13 +818,8 @@ class TradeApp(tk.Tk):
         except Exception as e:
             self.after(0, lambda t=token_symbol, err=e: self.update_status(f"An error occurred selling {t}: {err}", is_error=True))
 
-    def _finalize_sell_all_ui(self):
-        """Helper to re-enable UI elements after the sell-all process."""
-        self.after(0, lambda: self.sell_all_button.config(state=tk.NORMAL))
-        self.after(0, lambda: self.buy_button.config(state=tk.NORMAL))
-        self.after(0, lambda: self.sell_button.config(state=tk.NORMAL))
 
-    # --- Bot Toggles & Logic ---
+
     def _toggle_random_bot(self):
         self.random_bot_active = not self.random_bot_active
 
@@ -671,122 +854,60 @@ class TradeApp(tk.Tk):
 
 
 
-
-
-
-
     def _random_bot_logic(self):
         self.after(0, lambda: self.update_status("Random Bot Activated!", "Random bot thread started."))
         last_trade_type = 'SELL'  # Start by buying first
 
         while self.random_bot_active:
             try:
-                if not self.api.is_browser_open():
-                    self.after(0, lambda: self.update_status("Browser closed, stopping bot.", is_error=True))
+                # Check for valid session and browser state
+                if (not self.session_cookie) or (not self.api.is_browser_open()):
+                    self.after(0, lambda: self.update_status("Session/Browser not ready, stopping bot.", is_error=True))
                     self.after(0, self._toggle_random_bot)
                     break
 
                 token_symbol = self.selected_token_symbol.get()
                 trade_type = 'BUY' if last_trade_type == 'SELL' else 'SELL'
+                trade_successful = False
+                amount = 0
 
                 if trade_type == 'BUY':
                     balance_str = self.balance_var.get().split('$')[-1]
                     available_balance = float(balance_str.replace(',', ''))
-                    amount = 0
-                    if available_balance > 1:
-                        max_buy = available_balance * 0.80
-                        amount = random.uniform(max_buy * 0.50, max_buy)
-                        amount = math.floor(amount)
-
-                    if amount > 0:
-                        if self._trade_token_flow(token_symbol, trade_type, amount):
-                            last_trade_type = 'BUY'
-                            self.after(0, lambda: self.update_status("BUY successful. Waiting 0.5s before reload..."))
-                            time.sleep(0.5)
-                            coin_page_url = f"{BASE_URL}/coin/{token_symbol}"
-                            self.after(0, lambda: self.update_status(f"Reloading to {token_symbol} page..."))
-                            self.selenium_driver.get(coin_page_url)
-                            WebDriverWait(self.selenium_driver, 15).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-                        else:
-                            self.after(0, lambda: self.update_status(f"BUY failed. Retrying in 0.5 seconds."))
-                            time.sleep(0.5)
-                    else:
-                        self.after(0, lambda: self.update_status("Not enough funds for BUY, will try again.", is_error=True))
-                        last_trade_type = 'BUY'
-                        time.sleep(0.5)
-                        continue
-
-                else:  # SELL logic
-                    self.selenium_driver.get(f"{BASE_URL}/coin/{token_symbol}") # Go to page once
-
-                    sell_tab_xpath = TRADE_BUTTON_XPATH_TEMPLATE.format(trade_type='sell')
-                    sell_tab_button = WebDriverWait(self.selenium_driver, 10).until(EC.element_to_be_clickable((By.XPATH, sell_tab_xpath)))
-                    sell_tab_button.click()
-
-                    self.after(0, lambda: self.update_status("Waiting 0.5s for sell info to load..."))
-                    time.sleep(0.5)
 
                     try:
-                        # --- Scrape, Enter, and Confirm all in one continuous flow ---
-                        parent_div_xpath = "//input[@type='number' and @placeholder='0.00']/ancestor::div[2]"
-                        parent_element = WebDriverWait(self.selenium_driver, 10).until(EC.visibility_of_element_located((By.XPATH, parent_div_xpath)))
-                        all_text = parent_element.text
-                        if DEBUG_MODE:
-                            print(f"[DEBUG] Scraped sell panel text: '{all_text.replace('\n', ' | ')}'")
+                        # Get the user-defined max buy limit from the UI
+                        max_buy_limit = float(self.random_max_buy_entry.get())
+                    except ValueError:
+                        max_buy_limit = 10.0 # Default to 10 if input is invalid
 
-                        parts = all_text.split()
+                    if available_balance > 1:
+                        # Determine the max possible buy, respecting the user's limit
+                        max_buy = min(available_balance * 0.80, max_buy_limit)
+                        if max_buy > 1:
+                            # Calculate a more random amount within the allowed range
+                            amount = math.floor(random.uniform(max_buy * 0.20, max_buy * 0.95))
 
-                        effective_max = 0
-                        if "Max sellable" in all_text:
-                            available_amount = float(parts[parts.index("Available:") + 1].replace(',', ''))
-                            max_sell_pool = float(parts[parts.index("sellable:") + 1].replace(',', ''))
-                            effective_max = min(available_amount, max_sell_pool)
-                        elif "Available:" in all_text:
-                            effective_max = float(parts[parts.index("Available:") + 1].replace(',', ''))
-                        else:
-                            raise Exception("Could not find balance info on page.")
+                    if amount > 0:
+                        # Use the fast API to buy
+                        trade_successful = self._trade_via_api(token_symbol, trade_type, amount, "RandomBot")
 
-                        amount = 0
-                        if effective_max > 1:
-                            max_sell = effective_max * 0.80
-                            amount = random.uniform(1.0, max_sell) if max_sell > 1 else max_sell
-                            amount = math.floor(amount)
+                    last_trade_type = 'BUY' # Set type for next iteration
 
-                        if amount > 0:
-                            # --- Actions are now performed immediately after scraping ---
-                            self.after(0, lambda a=amount: self.update_status(f"Entering sell amount: {a}"))
-                            amount_input = self.selenium_driver.find_element(By.XPATH, AMOUNT_INPUT_XPATH)
-                            amount_input.clear()
-                            amount_input.send_keys(str(amount))
+                else:  # SELL logic
+                    # Use the robust scraping method to determine the sell amount
+                    amount = self._scrape_and_calculate_sell_amount(token_symbol)
 
-                            self.after(0, lambda: self.update_status("Confirming sell..."))
-                            confirm_xpath = CONFIRM_BUTTON_XPATH_TEMPLATE.format(trade_type='sell', token_symbol=token_symbol.lower())
-                            confirm_button = WebDriverWait(self.selenium_driver, 10).until(EC.element_to_be_clickable((By.XPATH, confirm_xpath)))
-                            self.selenium_driver.execute_script("arguments[0].click();", confirm_button)
+                    if amount > 0:
+                        # Use the fast API to sell the scraped amount
+                        trade_successful = self._trade_via_api(token_symbol, trade_type, amount, "RandomBot")
 
-                            outcome_element = WebDriverWait(self.selenium_driver, 15).until(EC.visibility_of_element_located((By.XPATH, TRADE_OUTCOME_XPATH)))
-                            if 'successful' in outcome_element.text.lower():
-                                self.after(0, lambda: self.update_status("SELL successful. Waiting 0.5s before next buy..."))
-                                last_trade_type = 'SELL'
-                                time.sleep(0.5)
-                            else:
-                                self.after(0, lambda: self.update_status(f"SELL failed: {outcome_element.text}.", is_error=True))
-                                time.sleep(0.5)
-                        else:
-                            self.after(0, lambda: self.update_status("Not enough tokens to SELL, will try again.", is_error=True))
-                            last_trade_type = 'SELL'
-                            time.sleep(0.5)
-                            continue
-
-                    except Exception as scrape_error:
-                        self.after(0, lambda e=scrape_error: self.update_status(f"Error during sell sequence: {e}", is_error=True))
-                        last_trade_type = 'SELL'
-                        time.sleep(0.5)
-                        continue
+                    last_trade_type = 'SELL' # Set type for next iteration
 
             except Exception as e:
                 self.after(0, lambda e=e: self.update_status(f"Critical error in random bot: {e}", is_error=True))
-                time.sleep(0.5)
+                time.sleep(2) # Keep a small sleep only for critical error cases
+
 
 
 
@@ -844,7 +965,7 @@ class TradeApp(tk.Tk):
         except Exception: pass
 
         while self.sniper_bot_active:
-            time.sleep(1)
+            time.sleep(0.5)
             try:
                 newest_coin_data = self.api.get_newest_coin()
                 current_newest = newest_coin_data.get("coins", [{}])[0].get('symbol') if newest_coin_data.get("coins") else last_seen_coin_symbol
@@ -886,7 +1007,7 @@ class TradeApp(tk.Tk):
                         continue
 
                     # Execute the buy using the main driver
-                    buy_successful = self._trade_token_flow(token_symbol, 'BUY', buy_amount, self.selenium_driver, "BUY-THREAD")
+                    buy_successful = self._trade_via_api(token_symbol, 'BUY', buy_amount, "SniperAPI")
 
                     if buy_successful:
                         # --- Launch the parallel post-buy worker ---
@@ -942,7 +1063,7 @@ class TradeApp(tk.Tk):
             self.after(0, lambda: self.update_status(f"🛠️ {log_prefix} Cloning profile..."))
             source_profile = CHROME_USER_DATA_DIR
             temp_profile_path = tempfile.mkdtemp(suffix=f"_worker_{worker_id}")
-            ignore_patterns = shutil.ignore_patterns('Singleton*', 'lockfile')
+            ignore_patterns = shutil.ignore_patterns('Singleton*', 'lockfile', '*Cache*', '*Code Cache*', '*ShaderCache*')
             shutil.copytree(source_profile, temp_profile_path, dirs_exist_ok=True, ignore=ignore_patterns)
 
             options = Options()
@@ -1014,9 +1135,9 @@ class TradeApp(tk.Tk):
                         self.after(0, lambda: self.update_status(f"{log_prefix} Action: Pool limit detected. Selling max."))
                         WebDriverWait(dedicated_driver, 5).until(EC.element_to_be_clickable((By.XPATH, MAX_BUTTON_XPATH))).click()
                     elif "Available" in panel_text:
-                        self.after(0, lambda: self.update_status(f"{log_prefix} Action: No pool limit. Selling 50%."))
+                        self.after(0, lambda: self.update_status(f"{log_prefix} Action: No pool limit. Selling 80%."))
                         available_amount_val = float(available_text.replace(',', ''))
-                        final_amount = math.floor(available_amount_val * 0.50)
+                        final_amount = math.floor(available_amount_val * 0.80)
                         if final_amount < 1:
                             self.after(0, lambda: self.update_status(f"{log_prefix} Remainder too small. Ending cycle."))
                             break
@@ -1056,6 +1177,8 @@ class TradeApp(tk.Tk):
             if temp_profile_path and os.path.exists(temp_profile_path):
                 shutil.rmtree(temp_profile_path, ignore_errors=True)
             self.after(0, lambda: self.update_status(f"🗑️ {log_prefix} Worker finished and cleaned up."))
+
+
 
 
 
